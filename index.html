@@ -1,0 +1,716 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<title>3D Мир с чанками</title>
+<style>
+  body { margin: 0; overflow: hidden; background: #87ceeb; font-family: Arial; }
+  #info {
+    position: absolute; top: 10px; left: 10px; color: white;
+    background: rgba(0,0,0,0.6); padding: 12px; border-radius: 8px;
+    font-size: 14px; pointer-events: none; line-height: 1.5;
+    transition: opacity 0.25s;
+  }
+  #info.hidden { opacity: 0; }
+  #chunkinfo {
+    position: absolute; top: 10px; right: 10px; color: white;
+    background: rgba(0,0,0,0.6); padding: 10px 14px; border-radius: 8px;
+    font-size: 13px; pointer-events: none; line-height: 1.4;
+    transition: opacity 0.25s;
+  }
+  #chunkinfo.hidden { opacity: 0; }
+  #toggle-hint {
+    position: absolute; bottom: 100px; left: 50%; transform: translateX(-50%);
+    color: white; background: rgba(0,0,0,0.5); padding: 6px 14px;
+    border-radius: 6px; font-size: 12px; pointer-events: none;
+    transition: opacity 0.25s;
+  }
+  #toggle-hint.hidden { opacity: 0; }
+  #hotbar {
+    position: absolute; bottom: 20px; left: 50%; transform: translateX(-50%);
+    display: flex; gap: 10px;
+  }
+  .slot {
+    width: 60px; height: 60px; border: 3px solid rgba(255,255,255,0.4);
+    border-radius: 8px; display: flex; align-items: center; justify-content: center;
+    color: white; font-weight: bold; font-size: 22px;
+    background: rgba(0,0,0,0.4); transition: 0.15s;
+    text-shadow: 0 0 4px black;
+  }
+  .slot.active {
+    border-color: #fff; transform: scale(1.15);
+    box-shadow: 0 0 20px rgba(255,255,255,0.8);
+  }
+  #crosshair {
+    position: absolute; top: 50%; left: 50%;
+    width: 20px; height: 20px; margin: -10px 0 0 -10px;
+    pointer-events: none;
+  }
+  #crosshair::before, #crosshair::after {
+    content: ''; position: absolute; background: white;
+    box-shadow: 0 0 3px black;
+  }
+  #crosshair::before { left: 50%; top: 0; width: 2px; height: 100%; margin-left: -1px; }
+  #crosshair::after  { top: 50%; left: 0; height: 2px; width: 100%; margin-top: -1px; }
+  #lock-hint {
+    position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%);
+    color: white; background: rgba(0,0,0,0.7); padding: 20px 40px;
+    border-radius: 12px; font-size: 20px; text-align: center;
+    pointer-events: none;
+  }
+</style>
+</head>
+<body>
+<div id="info">
+  <b>Управление:</b><br>
+  WASD - движение, Пробел - прыжок<br>
+  Мышь - обзор<br>
+  ЛКМ - поставить блок<br>
+  ПКМ - сломать блок<br>
+  <b>1 / 2 / 3</b> или колесо - выбор блока<br>
+  <b>H</b> - скрыть/показать меню
+</div>
+<div id="chunkinfo">Загрузка...</div>
+<div id="toggle-hint">Нажмите <b>H</b> чтобы скрыть меню</div>
+<div id="lock-hint">Кликните для начала игры</div>
+<div id="crosshair"></div>
+<div id="hotbar">
+  <div class="slot" data-i="0" style="background: rgba(255,68,68,0.5)">1</div>
+  <div class="slot" data-i="1" style="background: rgba(68,255,68,0.5)">2</div>
+  <div class="slot" data-i="2" style="background: rgba(68,68,255,0.5)">3</div>
+</div>
+
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://unpkg.com/three@0.160.0/build/three.module.js"
+  }
+}
+</script>
+
+<script type="module">
+import * as THREE from 'three';
+
+// ========================================================
+// БАЗОВАЯ НАСТРОЙКА
+// ========================================================
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x87ceeb);
+
+// Плавный туман — начинается раньше, кончается далеко за границей чанков,
+// чтобы переход был мягким и не было резкой прогрузки.
+// Дальность чанков: LOAD_RADIUS=1 => 3x3 чанка по 32 => ~96 блоков от центра.
+// Туман начинается с 30 и полностью скрывает всё к 110 — граница чанков (≈96)
+// попадает в зону тумана, но не в самый край.
+scene.fog = new THREE.Fog(0x87ceeb, 30, 110);
+
+const camera = new THREE.PerspectiveCamera(75, innerWidth/innerHeight, 0.1, 300);
+
+const renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: 'high-performance' });
+renderer.setSize(innerWidth, innerHeight);
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+document.body.appendChild(renderer.domElement);
+
+scene.add(new THREE.AmbientLight(0xffffff, 0.7));
+const sun = new THREE.DirectionalLight(0xffffff, 1.1);
+sun.position.set(40, 80, 30);
+sun.castShadow = true;
+sun.shadow.mapSize.set(2048, 2048);
+sun.shadow.camera.left = -100;
+sun.shadow.camera.right = 100;
+sun.shadow.camera.top = 100;
+sun.shadow.camera.bottom = -100;
+sun.shadow.camera.near = 1;
+sun.shadow.camera.far = 250;
+scene.add(sun);
+
+// ========================================================
+// КОНСТАНТЫ
+// ========================================================
+const CHUNK_SIZE = 32;
+const LOAD_RADIUS = 1;
+const MAX_HEIGHT = 2;         // высота природного рельефа
+const BUILD_HEIGHT = 24;      // сколько можно строить вверх (было 8, теперь 24)
+const HEIGHT_TOTAL = BUILD_HEIGHT + 1;  // массив по Y
+const GRAVITY = -22;
+
+const AIR   = 0;
+const GRASS = 1;
+const DIRT  = 2;
+const STONE = 3;
+const RED   = 10;
+const GREEN = 11;
+const BLUE  = 12;
+const UNLOADED = 255;
+
+// ========================================================
+// ГЕНЕРАЦИЯ
+// ========================================================
+function noise2D(x, z) {
+  let n = 0;
+  n += Math.sin(x * 0.08) * Math.cos(z * 0.08) * 0.55;
+  n += Math.sin(x * 0.17 + 1.3) * Math.cos(z * 0.17 + 0.7) * 0.3;
+  n += Math.sin(x * 0.35 + 2.1) * Math.cos(z * 0.35 + 3.4) * 0.15;
+  return n;
+}
+function getTerrainHeight(x, z) {
+  return Math.round(((noise2D(x, z) + 1) / 2) * MAX_HEIGHT);
+}
+
+// ========================================================
+// ХРАНИЛИЩЕ
+// ========================================================
+const chunks = new Map();
+function chunkKey(cx, cz) { return `${cx},${cz}`; }
+function localIndex(lx, y, lz) { return (lx * CHUNK_SIZE + lz) * HEIGHT_TOTAL + y; }
+
+function generateChunkData(cx, cz) {
+  const data = new Uint8Array(CHUNK_SIZE * CHUNK_SIZE * HEIGHT_TOTAL);
+  const ox = cx * CHUNK_SIZE, oz = cz * CHUNK_SIZE;
+  for (let lx = 0; lx < CHUNK_SIZE; lx++) {
+    for (let lz = 0; lz < CHUNK_SIZE; lz++) {
+      const h = getTerrainHeight(ox + lx, oz + lz);
+      for (let y = 0; y <= h; y++) {
+        let type;
+        if (y === h) type = GRASS;
+        else if (y === 0) type = STONE;
+        else type = DIRT;
+        data[localIndex(lx, y, lz)] = type;
+      }
+    }
+  }
+  return data;
+}
+
+function getBlockAt(x, y, z) {
+  if (y < 0 || y >= HEIGHT_TOTAL) return AIR;
+  const cx = Math.floor(x / CHUNK_SIZE);
+  const cz = Math.floor(z / CHUNK_SIZE);
+  const ch = chunks.get(chunkKey(cx, cz));
+  if (!ch) return UNLOADED;
+  const lx = x - cx * CHUNK_SIZE;
+  const lz = z - cz * CHUNK_SIZE;
+  return ch.data[localIndex(lx, y, lz)];
+}
+
+function setBlockAt(x, y, z, type) {
+  if (y < 0 || y >= HEIGHT_TOTAL) return false;
+  const cx = Math.floor(x / CHUNK_SIZE);
+  const cz = Math.floor(z / CHUNK_SIZE);
+  const ch = chunks.get(chunkKey(cx, cz));
+  if (!ch) return false;
+  const lx = x - cx * CHUNK_SIZE;
+  const lz = z - cz * CHUNK_SIZE;
+  ch.data[localIndex(lx, y, lz)] = type;
+  return true;
+}
+
+// ========================================================
+// ЦВЕТА И МАТЕРИАЛ
+// ========================================================
+const TYPE_COLORS = {
+  [GRASS]: new THREE.Color(0x4caf50),
+  [DIRT]:  new THREE.Color(0x8a6b4f),
+  [STONE]: new THREE.Color(0x9a9a9a),
+  [RED]:   new THREE.Color(0xff4444),
+  [GREEN]: new THREE.Color(0x44ff44),
+  [BLUE]:  new THREE.Color(0x4444ff)
+};
+
+const worldMaterial = new THREE.MeshStandardMaterial({
+  vertexColors: true,
+  roughness: 0.9,
+  metalness: 0.0,
+  side: THREE.DoubleSide
+});
+
+// ========================================================
+// КВАД
+// ========================================================
+function makeQuadPositions(cx, cy, cz, w, h, normal) {
+  const n = new THREE.Vector3(normal.x, normal.y, normal.z);
+  let u;
+  if (Math.abs(n.y) > 0.5) u = new THREE.Vector3(1, 0, 0);
+  else if (Math.abs(n.x) > 0.5) u = new THREE.Vector3(0, 0, 1);
+  else u = new THREE.Vector3(1, 0, 0);
+  const v = new THREE.Vector3().crossVectors(n, u).normalize();
+  const hw = w / 2, hh = h / 2;
+  const c = new THREE.Vector3(cx, cy, cz);
+  return [
+    c.clone().addScaledVector(u, -hw).addScaledVector(v, -hh),
+    c.clone().addScaledVector(u,  hw).addScaledVector(v, -hh),
+    c.clone().addScaledVector(u,  hw).addScaledVector(v,  hh),
+    c.clone().addScaledVector(u, -hw).addScaledVector(v,  hh)
+  ];
+}
+
+// ========================================================
+// ПОСТРОЕНИЕ МЕША
+// ========================================================
+function buildChunkMesh(cx, cz) {
+  const key = chunkKey(cx, cz);
+  let ch = chunks.get(key);
+  if (!ch) {
+    ch = { data: generateChunkData(cx, cz), mesh: null, cx, cz };
+    chunks.set(key, ch);
+  }
+  if (ch.mesh) {
+    scene.remove(ch.mesh);
+    ch.mesh.geometry.dispose();
+    ch.mesh = null;
+  }
+
+  const data = ch.data;
+  const ox = cx * CHUNK_SIZE;
+  const oz = cz * CHUNK_SIZE;
+
+  const getLocal = (lx, y, lz) => {
+    if (y < 0 || y >= HEIGHT_TOTAL) return AIR;
+    if (lx >= 0 && lx < CHUNK_SIZE && lz >= 0 && lz < CHUNK_SIZE) {
+      return data[localIndex(lx, y, lz)];
+    }
+    return getBlockAt(ox + lx, y, oz + lz);
+  };
+
+  const isFaceVisible = (cur, nb) => cur !== AIR && nb === AIR;
+
+  const positions = [];
+  const normals = [];
+  const colors = [];
+  const indices = [];
+  let vc = 0;
+
+  const pushQuad = (verts, n, type) => {
+    const base = vc;
+    for (const p of verts) positions.push(p.x, p.y, p.z);
+    for (let i = 0; i < 4; i++) normals.push(n.x, n.y, n.z);
+    const c = TYPE_COLORS[type] || new THREE.Color(0xff00ff);
+    for (let i = 0; i < 4; i++) colors.push(c.r, c.g, c.b);
+    indices.push(base, base + 1, base + 2, base, base + 2, base + 3);
+    vc += 4;
+  };
+
+  // ВЕРХ / НИЗ (greedy)
+  for (let y = 0; y < HEIGHT_TOTAL; y++) {
+    for (let dir = 0; dir < 2; dir++) {
+      const neighborY = dir === 0 ? y + 1 : y - 1;
+
+      const mask = [];
+      for (let lx = 0; lx < CHUNK_SIZE; lx++) {
+        mask[lx] = [];
+        for (let lz = 0; lz < CHUNK_SIZE; lz++) {
+          const cur = getLocal(lx, y, lz);
+          const nb = getLocal(lx, neighborY, lz);
+          mask[lx][lz] = isFaceVisible(cur, nb) ? cur : AIR;
+        }
+      }
+
+      for (let lx = 0; lx < CHUNK_SIZE; lx++) {
+        for (let lz = 0; lz < CHUNK_SIZE; lz++) {
+          const type = mask[lx][lz];
+          if (type === AIR) continue;
+
+          let w = 1;
+          while (lx + w < CHUNK_SIZE && mask[lx + w][lz] === type) w++;
+
+          let h = 1;
+          while (lz + h < CHUNK_SIZE) {
+            let ok = true;
+            for (let dx = 0; dx < w; dx++)
+              if (mask[lx + dx][lz + h] !== type) { ok = false; break; }
+            if (!ok) break;
+            h++;
+          }
+
+          for (let dx = 0; dx < w; dx++)
+            for (let dz = 0; dz < h; dz++)
+              mask[lx + dx][lz + dz] = AIR;
+
+          const cxw = lx + w / 2;
+          const czw = lz + h / 2;
+          const cyw = dir === 0 ? y + 1 : y;
+          const n = dir === 0 ? new THREE.Vector3(0, 1, 0) : new THREE.Vector3(0, -1, 0);
+
+          pushQuad(makeQuadPositions(cxw, cyw, czw, w, h, n), n, type);
+        }
+      }
+    }
+  }
+
+  // БОКОВЫЕ
+  for (let lx = 0; lx < CHUNK_SIZE; lx++) {
+    for (let y = 0; y < HEIGHT_TOTAL; y++) {
+      for (let lz = 0; lz < CHUNK_SIZE; lz++) {
+        const type = getLocal(lx, y, lz);
+        if (type === AIR) continue;
+        const cyw = y + 0.5;
+
+        if (isFaceVisible(type, getLocal(lx + 1, y, lz))) {
+          const n = new THREE.Vector3(1, 0, 0);
+          pushQuad(makeQuadPositions(lx + 1, cyw, lz + 0.5, 1, 1, n), n, type);
+        }
+        if (isFaceVisible(type, getLocal(lx - 1, y, lz))) {
+          const n = new THREE.Vector3(-1, 0, 0);
+          pushQuad(makeQuadPositions(lx, cyw, lz + 0.5, 1, 1, n), n, type);
+        }
+        if (isFaceVisible(type, getLocal(lx, y, lz + 1))) {
+          const n = new THREE.Vector3(0, 0, 1);
+          pushQuad(makeQuadPositions(lx + 0.5, cyw, lz + 1, 1, 1, n), n, type);
+        }
+        if (isFaceVisible(type, getLocal(lx, y, lz - 1))) {
+          const n = new THREE.Vector3(0, 0, -1);
+          pushQuad(makeQuadPositions(lx + 0.5, cyw, lz, 1, 1, n), n, type);
+        }
+      }
+    }
+  }
+
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+  geo.setAttribute('normal', new THREE.Float32BufferAttribute(normals, 3));
+  geo.setAttribute('color', new THREE.Float32BufferAttribute(colors, 3));
+  geo.setIndex(indices);
+  geo.computeBoundingSphere();
+
+  const mesh = new THREE.Mesh(geo, worldMaterial);
+  mesh.position.set(ox, 0, oz);
+  mesh.castShadow = true;
+  mesh.receiveShadow = true;
+  mesh.frustumCulled = true;
+
+  scene.add(mesh);
+  ch.mesh = mesh;
+}
+
+// ========================================================
+// УПРАВЛЕНИЕ ЧАНКАМИ
+// ========================================================
+let currentChunk = { cx: null, cz: null };
+
+function updateChunks() {
+  const cx = Math.floor(player.pos.x / CHUNK_SIZE);
+  const cz = Math.floor(player.pos.z / CHUNK_SIZE);
+  if (cx === currentChunk.cx && cz === currentChunk.cz) return;
+  currentChunk = { cx, cz };
+
+  const wanted = new Set();
+  for (let dx = -LOAD_RADIUS; dx <= LOAD_RADIUS; dx++) {
+    for (let dz = -LOAD_RADIUS; dz <= LOAD_RADIUS; dz++) {
+      const ncx = cx + dx, ncz = cz + dz;
+      const key = chunkKey(ncx, ncz);
+      wanted.add(key);
+      if (!chunks.has(key)) {
+        chunks.set(key, { data: generateChunkData(ncx, ncz), mesh: null, cx: ncx, cz: ncz });
+      }
+    }
+  }
+
+  for (const key of Array.from(chunks.keys())) {
+    if (!wanted.has(key)) {
+      const ch = chunks.get(key);
+      if (ch.mesh) { scene.remove(ch.mesh); ch.mesh.geometry.dispose(); }
+      chunks.delete(key);
+    }
+  }
+
+  for (const key of wanted) {
+    const [ncx, ncz] = key.split(',').map(Number);
+    buildChunkMesh(ncx, ncz);
+  }
+  updateChunkInfo();
+}
+
+function updateChunkInfo() {
+  let meshes = 0;
+  for (const ch of chunks.values()) if (ch.mesh) meshes++;
+  document.getElementById('chunkinfo').innerHTML =
+    `Чанков: <b>${chunks.size}</b><br>Мешей: ${meshes}<br>Центр: (${currentChunk.cx}, ${currentChunk.cz})`;
+}
+
+// ========================================================
+// ИГРОК
+// ========================================================
+const player = {
+  pos: new THREE.Vector3(0.5, 10, 0.5),
+  vel: new THREE.Vector3(),
+  onGround: false,
+  radius: 0.35,
+  height: 1.7,
+  eyeHeight: 1.6,
+  speed: 6.5,
+  jump: 7.5
+};
+
+updateChunks();
+(function spawn() {
+  player.pos.y = getTerrainHeight(0, 0) + 1;
+})();
+
+// ========================================================
+// КОЛЛИЗИИ
+// ========================================================
+function playerCollides(pos) {
+  const r = player.radius;
+  const minX = pos.x - r, maxX = pos.x + r;
+  const minY = pos.y, maxY = pos.y + player.height;
+  const minZ = pos.z - r, maxZ = pos.z + r;
+
+  for (let x = Math.floor(minX); x <= Math.floor(maxX); x++)
+    for (let y = Math.floor(minY); y <= Math.floor(maxY); y++)
+      for (let z = Math.floor(minZ); z <= Math.floor(maxZ); z++) {
+        const b = getBlockAt(x, y, z);
+        if (b !== AIR && b !== UNLOADED) {
+          if (maxX > x && minX < x + 1 &&
+              maxY > y && minY < y + 1 &&
+              maxZ > z && minZ < z + 1) return true;
+        }
+      }
+  return false;
+}
+
+function updatePlayer(dt) {
+  const forward = new THREE.Vector3(-Math.sin(yaw), 0, -Math.cos(yaw));
+  const right = new THREE.Vector3(Math.cos(yaw), 0, -Math.sin(yaw));
+  const wish = new THREE.Vector3();
+  if (keys['KeyW']) wish.add(forward);
+  if (keys['KeyS']) wish.sub(forward);
+  if (keys['KeyD']) wish.add(right);
+  if (keys['KeyA']) wish.sub(right);
+  if (wish.lengthSq() > 0) wish.normalize();
+
+  player.vel.y += GRAVITY * dt;
+  if (keys['Space'] && player.onGround) { player.vel.y = player.jump; player.onGround = false; }
+
+  const moveX = wish.x * player.speed * dt;
+  player.pos.x += moveX;
+  if (playerCollides(player.pos)) {
+    const tryPos = player.pos.clone(); tryPos.x -= moveX; tryPos.y += 1.05;
+    if (player.onGround && !playerCollides(tryPos)) player.pos.y += 1.05;
+    else player.pos.x -= moveX;
+  }
+
+  const moveZ = wish.z * player.speed * dt;
+  player.pos.z += moveZ;
+  if (playerCollides(player.pos)) {
+    const tryPos = player.pos.clone(); tryPos.z -= moveZ; tryPos.y += 1.05;
+    if (player.onGround && !playerCollides(tryPos)) player.pos.y += 1.05;
+    else player.pos.z -= moveZ;
+  }
+
+  const moveY = player.vel.y * dt;
+  player.pos.y += moveY;
+  player.onGround = false;
+  if (playerCollides(player.pos)) {
+    player.pos.y -= moveY;
+    if (moveY < 0) { player.onGround = true; player.vel.y = 0; }
+    else player.vel.y = 0;
+  }
+  if (player.pos.y < 0) { player.pos.y = 0; player.vel.y = 0; player.onGround = true; }
+}
+
+// ========================================================
+// ВОКСЕЛЬНЫЙ RAYCAST (DDA)
+// ========================================================
+function voxelRaycast(origin, dir, maxDist = 6) {
+  let x = Math.floor(origin.x), y = Math.floor(origin.y), z = Math.floor(origin.z);
+  const stepX = Math.sign(dir.x), stepY = Math.sign(dir.y), stepZ = Math.sign(dir.z);
+  const tDeltaX = stepX !== 0 ? Math.abs(1 / dir.x) : Infinity;
+  const tDeltaY = stepY !== 0 ? Math.abs(1 / dir.y) : Infinity;
+  const tDeltaZ = stepZ !== 0 ? Math.abs(1 / dir.z) : Infinity;
+  let tMaxX = stepX > 0 ? (x + 1 - origin.x) / dir.x : stepX < 0 ? (x - origin.x) / dir.x : Infinity;
+  let tMaxY = stepY > 0 ? (y + 1 - origin.y) / dir.y : stepY < 0 ? (y - origin.y) / dir.y : Infinity;
+  let tMaxZ = stepZ > 0 ? (z + 1 - origin.z) / dir.z : stepZ < 0 ? (z - origin.z) / dir.z : Infinity;
+
+  let face = null, t = 0;
+  while (t <= maxDist) {
+    const block = getBlockAt(x, y, z);
+    if (block !== AIR && block !== UNLOADED) return { x, y, z, block, face };
+    if (block === UNLOADED) return null;
+
+    if (tMaxX < tMaxY && tMaxX < tMaxZ) { x += stepX; t = tMaxX; tMaxX += tDeltaX; face = { x: -stepX, y: 0, z: 0 }; }
+    else if (tMaxY < tMaxZ) { y += stepY; t = tMaxY; tMaxY += tDeltaY; face = { x: 0, y: -stepY, z: 0 }; }
+    else { z += stepZ; t = tMaxZ; tMaxZ += tDeltaZ; face = { x: 0, y: 0, z: -stepZ }; }
+  }
+  return null;
+}
+
+// ========================================================
+// ПОДСВЕТКА / ПРИЗРАК
+// ========================================================
+const highlight = new THREE.Mesh(
+  new THREE.BoxGeometry(1.02, 1.02, 1.02),
+  new THREE.MeshBasicMaterial({ color: 0xffffff, wireframe: true, transparent: true, opacity: 0.9 })
+);
+highlight.visible = false;
+scene.add(highlight);
+
+const ghost = new THREE.Mesh(
+  new THREE.BoxGeometry(1.002, 1.002, 1.002),
+  new THREE.MeshBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.25, depthWrite: false })
+);
+ghost.visible = false;
+scene.add(ghost);
+
+const PLAYER_TYPE_BY_INDEX = [RED, GREEN, BLUE];
+const PLAYER_COLOR_BY_INDEX = [0xff4444, 0x44ff44, 0x4444ff];
+
+let selectedType = 0;
+const slots = document.querySelectorAll('.slot');
+function updateHotbar() { slots.forEach((s, i) => s.classList.toggle('active', i === selectedType)); }
+updateHotbar();
+
+// ========================================================
+// ВВОД + СКРЫТИЕ МЕНЮ
+// ========================================================
+let yaw = Math.PI, pitch = -0.1, locked = false;
+let uiHidden = false;
+const keys = {};
+const lockHint = document.getElementById('lock-hint');
+const infoEl = document.getElementById('info');
+const chunkInfoEl = document.getElementById('chunkinfo');
+const toggleHintEl = document.getElementById('toggle-hint');
+
+renderer.domElement.addEventListener('click', () => { if (!locked) renderer.domElement.requestPointerLock(); });
+document.addEventListener('pointerlockchange', () => {
+  locked = document.pointerLockElement === renderer.domElement;
+  lockHint.style.display = locked ? 'none' : 'block';
+});
+document.addEventListener('mousemove', (e) => {
+  if (!locked) return;
+  yaw -= e.movementX * 0.0025;
+  pitch = Math.max(-Math.PI/2 + 0.05, Math.min(Math.PI/2 - 0.05, pitch - e.movementY * 0.0025));
+});
+
+function toggleUI() {
+  uiHidden = !uiHidden;
+  infoEl.classList.toggle('hidden', uiHidden);
+  chunkInfoEl.classList.toggle('hidden', uiHidden);
+  toggleHintEl.classList.toggle('hidden', uiHidden);
+}
+
+document.addEventListener('keydown', e => {
+  keys[e.code] = true;
+  if (e.code === 'Digit1') { selectedType = 0; updateHotbar(); }
+  if (e.code === 'Digit2') { selectedType = 1; updateHotbar(); }
+  if (e.code === 'Digit3') { selectedType = 2; updateHotbar(); }
+  if (e.code === 'KeyH') toggleUI();
+});
+document.addEventListener('keyup', e => keys[e.code] = false);
+document.addEventListener('wheel', (e) => {
+  if (!locked) return;
+  const dir = e.deltaY > 0 ? 1 : -1;
+  selectedType = (selectedType + dir + 3) % 3;
+  updateHotbar();
+});
+renderer.domElement.addEventListener('mousedown', (e) => {
+  if (!locked) return;
+  if (e.button === 0) placeBlock();
+  if (e.button === 2) breakBlock();
+});
+renderer.domElement.addEventListener('contextmenu', e => e.preventDefault());
+
+function getCameraDir() {
+  return new THREE.Vector3(
+    -Math.sin(yaw) * Math.cos(pitch),
+    Math.sin(pitch),
+    -Math.cos(yaw) * Math.cos(pitch)
+  ).normalize();
+}
+
+function placeBlock() {
+  const hit = voxelRaycast(camera.position.clone(), getCameraDir(), 6);
+  if (!hit || !hit.face) return;
+  const px = hit.x + hit.face.x, py = hit.y + hit.face.y, pz = hit.z + hit.face.z;
+  if (py < 0 || py >= HEIGHT_TOTAL) return;
+  if (getBlockAt(px, py, pz) !== AIR) return;
+  if (collidesWithPlayer(px, py, pz)) return;
+  setBlockAt(px, py, pz, PLAYER_TYPE_BY_INDEX[selectedType]);
+  rebuildAround(px, pz);
+}
+
+function breakBlock() {
+  const hit = voxelRaycast(camera.position.clone(), getCameraDir(), 6);
+  if (!hit) return;
+  setBlockAt(hit.x, hit.y, hit.z, AIR);
+  rebuildAround(hit.x, hit.z);
+}
+
+function rebuildAround(x, z) {
+  const cx = Math.floor(x / CHUNK_SIZE);
+  const cz = Math.floor(z / CHUNK_SIZE);
+  const lx = x - cx * CHUNK_SIZE;
+  const lz = z - cz * CHUNK_SIZE;
+
+  const rebuild = (ccx, ccz) => {
+    const key = chunkKey(ccx, ccz);
+    if (chunks.has(key)) buildChunkMesh(ccx, ccz);
+  };
+
+  rebuild(cx, cz);
+  if (lx === 0) rebuild(cx - 1, cz);
+  if (lx === CHUNK_SIZE - 1) rebuild(cx + 1, cz);
+  if (lz === 0) rebuild(cx, cz - 1);
+  if (lz === CHUNK_SIZE - 1) rebuild(cx, cz + 1);
+}
+
+function collidesWithPlayer(bx, by, bz) {
+  const px = player.pos.x, pz = player.pos.z;
+  const pyBottom = player.pos.y, pyTop = player.pos.y + player.height;
+  const r = player.radius;
+  return (
+    bx + 1 > px - r && bx < px + r &&
+    bz + 1 > pz - r && bz < pz + r &&
+    by + 1 > pyBottom && by < pyTop
+  );
+}
+
+function updateHighlight() {
+  const hit = voxelRaycast(camera.position.clone(), getCameraDir(), 6);
+  if (!hit) { highlight.visible = false; ghost.visible = false; return; }
+  highlight.visible = true;
+  highlight.position.set(hit.x + 0.5, hit.y + 0.5, hit.z + 0.5);
+
+  if (!hit.face) { ghost.visible = false; return; }
+  const px = hit.x + hit.face.x, py = hit.y + hit.face.y, pz = hit.z + hit.face.z;
+  if (py < 0 || py >= HEIGHT_TOTAL || getBlockAt(px, py, pz) !== AIR || collidesWithPlayer(px, py, pz)) {
+    ghost.visible = false; return;
+  }
+  ghost.visible = true;
+  ghost.position.set(px + 0.5, py + 0.5, pz + 0.5);
+  ghost.material.color.setHex(PLAYER_COLOR_BY_INDEX[selectedType]);
+}
+
+// ========================================================
+// АНИМАЦИЯ
+// ========================================================
+let last = performance.now();
+let frameCount = 0;
+function animate() {
+  requestAnimationFrame(animate);
+  const now = performance.now();
+  const dt = Math.min((now - last) / 1000, 0.05);
+  last = now;
+
+  updatePlayer(dt);
+  updateChunks();
+
+  camera.position.set(player.pos.x, player.pos.y + player.eyeHeight, player.pos.z);
+  camera.lookAt(camera.position.clone().add(getCameraDir()));
+
+  updateHighlight();
+
+  if (frameCount++ % 10 === 0) updateChunkInfo();
+  renderer.render(scene, camera);
+}
+animate();
+
+addEventListener('resize', () => {
+  camera.aspect = innerWidth / innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+});
+</script>
+</body>
+</html>
